@@ -1,5 +1,8 @@
 # SPDX-FileCopyrightText: 2024 Nextcloud GmbH and Nextcloud contributors
 # SPDX-License-Identifier: AGPL-3.0-or-later
+import utils.http_session
+import utils.transport
+import utils.session
 import concurrent.futures
 import os
 import traceback
