@@ -17,10 +17,11 @@ from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from nc_py_api import AsyncNextcloudApp, NextcloudException
 from nc_py_api.ex_app import LogLvl
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from langchain_core.language_models.chat_models import BaseChatModel
 
+from ex_app.lib.errors import UserFacingError
 from ex_app.lib.logger import log
 
 
@@ -73,6 +74,18 @@ class Task(BaseModel):
 	status: str
 	output: dict[str, typing.Any] | None = None
 	preferStreaming: bool | None = None
+	# Serialized by Nextcloud 33+; the admin-facing `errorMessage` is never exposed over OCS
+	userFacingErrorMessage: str | None = None
+
+
+def task_failed_error(task: Task) -> UserFacingError:
+	"""Turn a failed sub-task into an error that passes the provider's user-facing message on."""
+	if task.userFacingErrorMessage:
+		return UserFacingError(
+			f"Nextcloud TaskProcessing Task failed: {task.userFacingErrorMessage}",
+			task.userFacingErrorMessage,
+		)
+	return UserFacingError("Nextcloud TaskProcessing Task failed")
 
 
 class Response(BaseModel):
@@ -80,7 +93,8 @@ class Response(BaseModel):
 
 # Custom formatting for chat inputs
 class ChatWithNextcloud(BaseChatModel):
-	nc: AsyncNextcloudApp = AsyncNextcloudApp()
+	# Create one instance per task: the client is scoped to the task's user
+	nc: AsyncNextcloudApp = Field(default_factory=AsyncNextcloudApp)
 	tools: Sequence[
 		Union[typing.Dict[str, Any], type, Callable, BaseTool]] = []
 	TIMEOUT: int = 60 * 30 # 30 minutes
@@ -285,13 +299,39 @@ class ChatWithNextcloud(BaseChatModel):
 
 		return default_tool_parser(raw_tool_calls)
 
-	def _task_to_message(self, task: Task) -> AIMessage:
+	async def _save_output_attachments(self, task: Task) -> list[dict[str, typing.Any]]:
+		"""
+		Save the task's output files to the user's Assistant folder and return them as file parts
+
+		Task output files live in appdata and cannot be used by tools, the saved copies in the user's folder can.
+		If saving fails (e.g. the Assistant app is missing or too old), the part keeps referencing the task output file.
+		"""
+		output_attachments = []
+		if isinstance(task.output, dict):
+			output_attachments = task.output.get('output_attachments') or []
+		parts = []
+		for file_id in output_attachments:
+			try:
+				saved = await self.nc.ocs(
+					"POST",
+					f"/ocs/v2.php/apps/assistant/api/v1/task/{task.id}/file/{int(file_id)}/save",
+				)
+				parts.append({"type": "file", "file_id": int(saved['fileId'])})
+			except Exception as e:
+				await log(self.nc, LogLvl.WARNING, f"Failed to save output file {file_id} of task {task.id} to the Assistant folder: {e}")
+				parts.append({"type": "file", "file_id": int(file_id), "ocp_task_id": task.id})
+		return parts
+
+	async def _task_to_message(self, task: Task) -> AIMessage:
 		if not isinstance(task.output, dict) or "output" not in task.output:
 			raise Exception('"output" key not found in Nextcloud TaskProcessing task result')
 
 		output_text = task.output['output']
-		output_attachments = task.output.get('output_attachments', [])
-		content = build_multimodal_content(output_text, output_attachments, task.id)
+		content: list[dict[str, typing.Any]] | str = await self._save_output_attachments(task)
+		if not content:
+			content = output_text
+		elif output_text:
+			content.append({"type": "text", "text": output_text})
 
 		tool_calls, invalid_tool_calls = self._task_tool_calls(task)
 		if len(tool_calls) > 0 or len(invalid_tool_calls) > 0:
@@ -334,12 +374,15 @@ class ChatWithNextcloud(BaseChatModel):
 				raise
 
 		if task.status == "STATUS_FAILED":
-			raise Exception("Nextcloud TaskProcessing Task failed")
+			raise task_failed_error(task)
 
 		if task.status in ("STATUS_RUNNING", "STATUS_SCHEDULED"):
-			raise Exception("Nextcloud TaskProcessing Task timed out")
+			raise UserFacingError(
+				"Nextcloud TaskProcessing Task timed out",
+				"The language model did not respond in time. Please try again.",
+			)
 
-		message = self._task_to_message(task)
+		message = await self._task_to_message(task)
 		return ChatResult(generations=[ChatGeneration(message=message)])
 
 	async def _astream(
@@ -381,10 +424,13 @@ class ChatWithNextcloud(BaseChatModel):
 				streamed_output = current_output
 
 		if task.status == "STATUS_FAILED":
-			raise Exception("Nextcloud TaskProcessing Task failed")
+			raise task_failed_error(task)
 
 		if task.status in ("STATUS_RUNNING", "STATUS_SCHEDULED"):
-			raise Exception("Nextcloud TaskProcessing Task timed out")
+			raise UserFacingError(
+				"Nextcloud TaskProcessing Task timed out",
+				"The language model did not respond in time. Please try again.",
+			)
 
 		final_output = self._task_output_text(task)
 		if final_output is None:
@@ -401,15 +447,12 @@ class ChatWithNextcloud(BaseChatModel):
 				yield ChatGenerationChunk(message=AIMessageChunk(content=final_delta))
 
 		tool_calls, invalid_tool_calls = self._task_tool_calls(task)
-		output_attachments = []
-		if isinstance(task.output, dict):
-			output_attachments = task.output.get('output_attachments') or []
+		content = await self._save_output_attachments(task)
 
-		if output_attachments:
+		if content:
 			# Append file parts after streamed text so LangChain merges them
 			# into the final AIMessage content (attachments are not streamed).
 			yielded_chunk = True
-			content = [{"type": "file", "file_id": int(file_id), "ocp_task_id": task.id} for file_id in output_attachments]
 			yield ChatGenerationChunk(message=AIMessageChunk(
 				content=content,
 				tool_calls=tool_calls,
@@ -429,14 +472,7 @@ class ChatWithNextcloud(BaseChatModel):
 			],
 			**kwargs: Any,
 	) -> Runnable[LanguageModelInput, BaseMessage]:
-		self.tools = [convert_to_openai_tool(tool) for tool in tools]
-		return self
-
-	def bind_nextcloud(self,
-					   nc: AsyncNextcloudApp):
-		self.nc = nc
+		return self.model_copy(update={"tools": [convert_to_openai_tool(tool) for tool in tools]})
 
 	def _llm_type(self) -> str:
 		return "nextcloud-context-agent"
-
-model = ChatWithNextcloud()
