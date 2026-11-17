@@ -6,14 +6,16 @@ import typing
 from langchain_core.tools import tool
 from nc_py_api import AsyncNextcloudApp
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 import vobject
 
-from ex_app.lib.all_tools.lib.decorator import safe_tool
+from ex_app.lib.all_tools.lib.impulse import ImpulseRadius, impulse, read_only
 
 
 async def get_tools(nc: AsyncNextcloudApp):
 	@tool
-	@safe_tool
+	@impulse(ImpulseRadius.SELF)
+	@read_only
 	async def find_person_in_users(search_term: str):
 		"""
 		Search for users
@@ -31,7 +33,8 @@ async def get_tools(nc: AsyncNextcloudApp):
 		return json.dumps(dict)
 
 	@tool
-	@safe_tool
+	@impulse(ImpulseRadius.SELF)
+	@read_only
 	async def find_person_in_contacts(name: str) -> list[dict[str, typing.Any]]:
 		"""
 		Find a person's contact information from their name
@@ -66,14 +69,14 @@ async def get_tools(nc: AsyncNextcloudApp):
 		</C:prop-filter>
 	  </C:filter>
 	</C:addressbook-query>
-	""".replace('{NAME}', name)
+	""".replace('{NAME}', escape(name))
 			response = await nc._session._create_adapter(True).request('REPORT', f"{nc.app_cfg.endpoint}{link}", headers={
 				"Content-Type": "application/xml; charset=utf-8",
 				"Depth": "1",
 			}, data=xml_body)
 
 			if response.status_code != 207:  # Multi-Status
-				raise Exception(f"Error: {response.status_code} - {response.reason_phrase}")
+				raise Exception(f"Error: {response.status_code} - {response.reason}")
 
 			# Parse the XML response to extract vCard data
 			namespace = {"DAV": "urn:ietf:params:xml:ns:carddav"}  # Define the namespace
@@ -89,13 +92,14 @@ async def get_tools(nc: AsyncNextcloudApp):
 					"full_name": getattr(vcard, "fn", None).value if hasattr(vcard, "fn") else None,
 					"email": getattr(vcard.email, "value", None) if hasattr(vcard, "email") else None,
 					"phone": getattr(vcard.tel, "value", None) if hasattr(vcard, "tel") else None,
-					"address": getattr(vcard.adr, "value", None) if hasattr(vcard, "adr") else None,
+					"address": str(vcard.adr.value) if hasattr(vcard, "adr") else None,
 				}
 				contacts.append(contact)
 		return contacts
 
 	@tool
-	@safe_tool
+	@impulse(ImpulseRadius.SELF)
+	@read_only
 	async def find_details_of_current_user() -> dict[str, typing.Any]:
 		"""
 		Find the current user's personal information, such as name, location, timezone, language
